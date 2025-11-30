@@ -51,13 +51,13 @@ let test_symbol () =
     assert_eq Fun.id "IBM" (Message_types.Symbol.to_string (Option.get sym))
   );
   
-  test "max length symbol (8 chars)" (fun () ->
-    let sym = Message_types.Symbol.of_string "ABCDEFGH" in
+  test "max length symbol (16 chars)" (fun () ->
+    let sym = Message_types.Symbol.of_string "ABCDEFGHIJKLMNOP" in
     assert_true "should be Some" (Option.is_some sym)
   );
   
   test "too long symbol rejected" (fun () ->
-    let sym = Message_types.Symbol.of_string "ABCDEFGHI" in
+    let sym = Message_types.Symbol.of_string "ABCDEFGHIJKLMNOPQ" in
     assert_true "should be None" (Option.is_none sym)
   );
   
@@ -69,7 +69,7 @@ let test_symbol () =
   test "symbol to bytes (8-byte padded)" (fun () ->
     let sym = Message_types.Symbol.of_string_exn "IBM" in
     let bytes = Message_types.Symbol.to_bytes sym in
-    assert_eq string_of_int 8 (Bytes.length bytes);
+    assert_eq string_of_int 16 (Bytes.length bytes);
     assert_eq Fun.id "IBM" (Bytes.sub_string bytes 0 3);
     assert_eq string_of_int 0 (Bytes.get_uint8 bytes 3)
   )
