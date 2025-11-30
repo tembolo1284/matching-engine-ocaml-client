@@ -1,53 +1,53 @@
 (* lib/client/engine_client.ml *)
 
-(** Main matching engine client.
-    
-    Provides a high-level interface for interacting with the matching engine:
-    - Auto-discovery of transport and protocol
-    - Sending orders, cancels, and flushes
-    - Receiving and processing responses
-    - Callback-based response handling
+(** High-level client API for the matching engine.
+
+    Provides a simple interface for:
+    - Connecting to the server (with auto-discovery)
+    - Placing orders (buy/sell)
+    - Canceling orders
+    - Receiving responses
 *)
 
-open Message_types
-
 (** ============================================================================
-    Client Types
+    Types
     ============================================================================ *)
 
 type client_config = {
   host: string;
   port: int;
-  transport: transport option;  (* None = auto-detect *)
-  protocol: protocol option;    (* None = auto-detect *)
-  timeout: float;               (* Default timeout for operations *)
-  verbose: bool;                (* Print debug info *)
+  transport: Message_types.transport option;  (* None = auto-discover *)
+  protocol: Message_types.protocol option;    (* None = auto-discover *)
+  timeout: float;
+  verbose: bool;
 }
 
 type client = {
   config: client_config;
   mutable connection: Transport.connection option;
-  mutable user_id: int32;       (* Assigned by server in TCP mode *)
-  mutable next_order_id: int32; (* Local order ID counter *)
+  mutable user_id: int32;
+  mutable next_order_id: int32;
   mutable connected: bool;
 }
 
 type client_error =
+  | Connection_failed of string
+  | Discovery_failed of string
   | Not_connected
-  | Discovery_failed of Discovery.discovery_error
   | Send_error of Transport.send_error
   | Recv_error of Transport.recv_error
-  | Invalid_response of string
+  | Invalid_symbol of string
 
 let client_error_to_string = function
+  | Connection_failed s -> Printf.sprintf "Connection failed: %s" s
+  | Discovery_failed s -> Printf.sprintf "Discovery failed: %s" s
   | Not_connected -> "Not connected"
-  | Discovery_failed e -> Discovery.discovery_error_to_string e
   | Send_error e -> Transport.send_error_to_string e
   | Recv_error e -> Transport.recv_error_to_string e
-  | Invalid_response msg -> Printf.sprintf "Invalid response: %s" msg
+  | Invalid_symbol s -> Printf.sprintf "Invalid symbol: %s" s
 
 (** ============================================================================
-    Client Creation
+    Configuration
     ============================================================================ *)
 
 let default_config ~host ~port () : client_config = {
@@ -59,289 +59,275 @@ let default_config ~host ~port () : client_config = {
   verbose = false;
 }
 
+(** ============================================================================
+    Client Creation and Connection
+    ============================================================================ *)
+
 let create (config : client_config) : client = {
   config;
   connection = None;
-  user_id = 1l;  (* Default, may be assigned by server *)
+  user_id = 1l;
   next_order_id = 1l;
   connected = false;
 }
 
-(** ============================================================================
-    Connection Management
-    ============================================================================ *)
-
-(** Connect to server with auto-discovery or explicit settings *)
+(** Connect to server, with auto-discovery if transport/protocol not specified *)
 let connect (client : client) : (unit, client_error) result =
-  (* Disconnect if already connected *)
-  begin match client.connection with
-  | Some conn -> 
-    Transport.close conn;
-    client.connection <- None;
-    client.connected <- false
-  | None -> ()
-  end;
+  let cfg = client.config in
   
-  let config = client.config in
+  (* Determine transport and protocol *)
+  let get_transport_protocol () =
+    match cfg.transport, cfg.protocol with
+    | Some t, Some p -> Ok (t, p)
+    | _ ->
+      (* Need to discover *)
+      match Discovery.discover ~host:cfg.host ~port:cfg.port ~timeout:cfg.timeout () with
+      | Result.Error e -> Result.Error (Discovery_failed (Discovery.discovery_error_to_string e))
+      | Ok result ->
+        let transport = match cfg.transport with
+          | Some t -> t
+          | None -> result.Discovery.transport
+        in
+        let protocol = match cfg.protocol with
+          | Some p -> p
+          | None -> result.Discovery.protocol
+        in
+        Ok (transport, protocol)
+  in
   
-  (* Use explicit settings or auto-discover *)
-  match config.transport, config.protocol with
-  | Some transport, Some protocol ->
-    (* Explicit configuration - no discovery *)
-    begin match Discovery.connect_explicit ~transport ~host:config.host ~port:config.port () with
-    | Error e -> Error (Discovery_failed e)
-    | Ok socket ->
-      let conn = Transport.create 
-        ~socket ~transport ~protocol 
-        ~host:config.host ~port:config.port () 
+  match get_transport_protocol () with
+  | Result.Error e -> Result.Error e
+  | Ok (transport, protocol) ->
+    (* Create socket and connect *)
+    try
+      let sock_type = match transport with
+        | Message_types.TCP -> Unix.SOCK_STREAM
+        | Message_types.UDP -> Unix.SOCK_DGRAM
       in
-      client.connection <- Some conn;
+      let sock = Unix.socket Unix.PF_INET sock_type 0 in
+      
+      let host_entry = Unix.gethostbyname cfg.host in
+      let addr = Unix.ADDR_INET (host_entry.Unix.h_addr_list.(0), cfg.port) in
+      
+      begin match transport with
+      | Message_types.TCP ->
+        Unix.connect sock addr;
+        let conn = Transport.create_connection
+          ~socket:sock ~transport ~protocol
+          ~host:cfg.host ~port:cfg.port ()
+        in
+        client.connection <- Some conn
+      | Message_types.UDP ->
+        (* UDP doesn't need connect, but we store the remote address *)
+        let conn = Transport.create_connection
+          ~socket:sock ~transport ~protocol
+          ~host:cfg.host ~port:cfg.port ~remote_addr:addr ()
+        in
+        client.connection <- Some conn
+      end;
+      
       client.connected <- true;
-      if config.verbose then
-        Printf.printf "[Client] Connected: %s\n%!" (Transport.connection_info conn);
+      
+      if cfg.verbose then
+        Printf.printf "Connected: %s\n%!" (info client);
+      
       Ok ()
-    end
-  
-  | _ ->
-    (* Auto-discovery *)
-    begin match Discovery.discover ~host:config.host ~port:config.port () with
-    | Error e -> Error (Discovery_failed e)
-    | Ok (result, socket) ->
-      let conn = Transport.create
-        ~socket
-        ~transport:result.transport
-        ~protocol:result.protocol
-        ~host:config.host
-        ~port:config.port
-        ()
-      in
-      client.connection <- Some conn;
-      client.connected <- true;
-      if config.verbose then
-        Printf.printf "[Client] Discovered and connected: %s\n%!" 
-          (Transport.connection_info conn);
-      Ok ()
-    end
+    with
+    | Unix.Unix_error (err, fn, _) ->
+      Result.Error (Connection_failed (Printf.sprintf "%s: %s" fn (Unix.error_message err)))
+    | Not_found ->
+      Result.Error (Connection_failed (Printf.sprintf "Unknown host: %s" cfg.host))
+    | e ->
+      Result.Error (Connection_failed (Printexc.to_string e))
 
 (** Disconnect from server *)
 let disconnect (client : client) : unit =
   match client.connection with
+  | None -> ()
   | Some conn ->
     Transport.close conn;
     client.connection <- None;
-    client.connected <- false;
-    if client.config.verbose then
-      Printf.printf "[Client] Disconnected\n%!"
-  | None -> ()
-
-(** Check if connected *)
-let is_connected (client : client) : bool =
-  client.connected && Option.is_some client.connection
+    client.connected <- false
 
 (** ============================================================================
-    Order Operations
+    Sending Messages
     ============================================================================ *)
 
-(** Generate next order ID *)
+(** Get next order ID and increment counter *)
 let next_order_id (client : client) : int32 =
   let id = client.next_order_id in
   client.next_order_id <- Int32.add client.next_order_id 1l;
   id
 
 (** Send a new order *)
-let send_order 
-    (client : client) 
-    ~symbol 
-    ~price 
-    ~quantity 
-    ~side 
-    ?(order_id : int32 option)
-    () : (int32, client_error) result =
+let send_order (client : client) 
+    ~symbol ~price ~quantity ~side ?order_id () 
+    : (int32, client_error) result =
   match client.connection with
-  | None -> Error Not_connected
+  | None -> Result.Error Not_connected
   | Some conn ->
-    let order_id = match order_id with
+    let oid = match order_id with
       | Some id -> id
       | None -> next_order_id client
     in
-    let msg = make_new_order 
-      ~user_id:client.user_id
-      ~symbol
-      ~price
-      ~quantity
-      ~side
-      ~order_id
-    in
-    if client.config.verbose then
-      Printf.printf "[Client] Sending order: %s %s %ld @ %ld (id=%ld)\n%!"
-        (match side with Buy -> "BUY" | Sell -> "SELL")
-        (Symbol.to_string symbol)
-        quantity price order_id;
-    match Transport.send conn msg with
-    | Ok _ -> Ok order_id
-    | Error e -> Error (Send_error e)
+    let order : Message_types.new_order = {
+      user_id = client.user_id;
+      user_order_id = oid;
+      price;
+      quantity;
+      side;
+      symbol;
+    } in
+    match Transport.send conn (Message_types.NewOrder order) with
+    | Result.Error e -> Result.Error (Send_error e)
+    | Ok _ -> Ok oid
 
-(** Send a cancel request *)
-let send_cancel 
-    (client : client) 
-    ~order_id 
-    () : (unit, client_error) result =
+(** Send cancel order *)
+let send_cancel (client : client) ~order_id () : (unit, client_error) result =
   match client.connection with
-  | None -> Error Not_connected
+  | None -> Result.Error Not_connected
   | Some conn ->
-    let msg = make_cancel 
-      ~user_id:client.user_id
-      ~symbol:(Symbol.of_string_exn "?")  (* Cancel doesn't need symbol on wire *)
-      ~order_id
-    in
-    if client.config.verbose then
-      Printf.printf "[Client] Sending cancel: order_id=%ld\n%!" order_id;
-    match Transport.send conn msg with
+    let cancel : Message_types.cancel_order = {
+      cancel_user_id = client.user_id;
+      cancel_user_order_id = order_id;
+      cancel_symbol = Message_types.Symbol.of_string_exn "?";  (* Not used in wire format *)
+    } in
+    match Transport.send conn (Message_types.CancelOrder cancel) with
+    | Result.Error e -> Result.Error (Send_error e)
     | Ok _ -> Ok ()
-    | Error e -> Error (Send_error e)
 
-(** Send a flush command *)
+(** Send flush command *)
 let send_flush (client : client) : (unit, client_error) result =
   match client.connection with
-  | None -> Error Not_connected
+  | None -> Result.Error Not_connected
   | Some conn ->
-    let msg = make_flush () in
-    if client.config.verbose then
-      Printf.printf "[Client] Sending flush\n%!";
-    match Transport.send conn msg with
+    match Transport.send conn Message_types.Flush with
+    | Result.Error e -> Result.Error (Send_error e)
     | Ok _ -> Ok ()
-    | Error e -> Error (Send_error e)
+
+(** Send raw input message *)
+let send_raw (client : client) (msg : Message_types.input_msg) 
+    : (unit, client_error) result =
+  match client.connection with
+  | None -> Result.Error Not_connected
+  | Some conn ->
+    match Transport.send conn msg with
+    | Result.Error e -> Result.Error (Send_error e)
+    | Ok _ -> Ok ()
 
 (** ============================================================================
-    Receiving Responses
+    Receiving Messages
     ============================================================================ *)
 
-(** Receive one response message *)
-let recv (client : client) : (output_msg, client_error) result =
+(** Receive one message *)
+let recv ?(timeout = 5.0) (client : client) 
+    : (Message_types.output_msg, client_error) result =
   match client.connection with
-  | None -> Error Not_connected
+  | None -> Result.Error Not_connected
   | Some conn ->
-    match Transport.recv ~timeout:client.config.timeout conn with
-    | Ok msg ->
-      if client.config.verbose then
-        Printf.printf "[Client] Received: %s\n%!" (output_msg_to_string_verbose msg);
-      Ok msg
-    | Error e -> Error (Recv_error e)
+    match Transport.recv ~timeout conn with
+    | Result.Error e -> Result.Error (Recv_error e)
+    | Ok msg -> Ok msg
 
-(** Try to receive without blocking *)
-let try_recv (client : client) : (output_msg option, client_error) result =
+(** Try to receive (non-blocking) *)
+let try_recv (client : client) 
+    : (Message_types.output_msg option, client_error) result =
   match client.connection with
-  | None -> Error Not_connected
+  | None -> Result.Error Not_connected
   | Some conn ->
     match Transport.try_recv conn with
-    | Ok msg_opt ->
-      begin match msg_opt with
-      | Some msg when client.config.verbose ->
-        Printf.printf "[Client] Received: %s\n%!" (output_msg_to_string_verbose msg)
-      | _ -> ()
-      end;
-      Ok msg_opt
-    | Error e -> Error (Recv_error e)
+    | Result.Error e -> Result.Error (Recv_error e)
+    | Ok msg_opt -> Ok msg_opt
 
-(** Receive all available responses (non-blocking after first) *)
-let recv_all ?(timeout=5.0) (client : client) : (output_msg list, client_error) result =
+(** Receive all available messages within timeout *)
+let recv_all ?(timeout = 1.0) (client : client) 
+    : (Message_types.output_msg list, client_error) result =
   match client.connection with
-  | None -> Error Not_connected
+  | None -> Result.Error Not_connected
   | Some conn ->
     match Transport.recv_batch ~timeout conn with
-    | Ok msgs ->
-      if client.config.verbose then
-        List.iter (fun msg ->
-          Printf.printf "[Client] Received: %s\n%!" (output_msg_to_string_verbose msg)
-        ) msgs;
-      Ok msgs
-    | Error e -> Error (Recv_error e)
+    | Result.Error Transport.Timeout -> Ok []
+    | Result.Error e -> Result.Error (Recv_error e)
+    | Ok msgs -> Ok msgs
 
 (** ============================================================================
-    High-Level Operations (Send + Receive)
+    High-Level Operations
     ============================================================================ *)
 
-(** Send order and wait for acknowledgment *)
-let place_order
-    (client : client)
-    ~symbol
-    ~price
-    ~quantity
-    ~side
-    () : (int32 * output_msg list, client_error) result =
-  match send_order client ~symbol ~price ~quantity ~side () with
-  | Error e -> Error e
-  | Ok order_id ->
-    (* Receive responses (ack, possibly trades, TOB updates) *)
-    match recv_all ~timeout:client.config.timeout client with
-    | Error e -> Error e
-    | Ok msgs -> Ok (order_id, msgs)
+(** Place order and wait for response *)
+let place_order (client : client)
+    ~symbol ~price ~quantity ~side ?order_id ()
+    : (int32 * Message_types.output_msg list, client_error) result =
+  match send_order client ~symbol ~price ~quantity ~side ?order_id () with
+  | Result.Error e -> Result.Error e
+  | Ok oid ->
+    match recv_all ~timeout:1.0 client with
+    | Result.Error e -> Result.Error e
+    | Ok msgs -> Ok (oid, msgs)
 
-(** Cancel order and wait for acknowledgment *)
-let cancel_order
-    (client : client)
-    ~order_id
-    () : (output_msg list, client_error) result =
+(** Cancel order and wait for response *)
+let cancel_order (client : client) ~order_id ()
+    : (Message_types.output_msg list, client_error) result =
   match send_cancel client ~order_id () with
-  | Error e -> Error e
-  | Ok () -> recv_all ~timeout:client.config.timeout client
+  | Result.Error e -> Result.Error e
+  | Ok () -> recv_all ~timeout:1.0 client
 
-(** Flush all orders and collect cancel acks *)
-let flush_orders (client : client) : (output_msg list, client_error) result =
+(** Flush all orders and wait for response *)
+let flush_orders (client : client)
+    : (Message_types.output_msg list, client_error) result =
   match send_flush client with
-  | Error e -> Error e
-  | Ok () -> recv_all ~timeout:client.config.timeout client
+  | Result.Error e -> Result.Error e
+  | Ok () -> recv_all ~timeout:2.0 client
+
+(** Convenience: place buy order *)
+let buy (client : client) ~symbol ~price ~quantity ?order_id ()
+    : (int32 * Message_types.output_msg list, client_error) result =
+  place_order client ~symbol ~price ~quantity ~side:Message_types.Buy ?order_id ()
+
+(** Convenience: place sell order *)
+let sell (client : client) ~symbol ~price ~quantity ?order_id ()
+    : (int32 * Message_types.output_msg list, client_error) result =
+  place_order client ~symbol ~price ~quantity ~side:Message_types.Sell ?order_id ()
 
 (** ============================================================================
-    Convenience Helpers
+    Client Info and State
     ============================================================================ *)
 
-(** Buy order shorthand *)
-let buy client ~symbol ~price ~quantity () =
-  place_order client ~symbol ~price ~quantity ~side:Buy ()
+let info (client : client) : string =
+  match client.connection with
+  | None -> "Not connected"
+  | Some conn -> Transport.info conn
 
-(** Sell order shorthand *)
-let sell client ~symbol ~price ~quantity () =
-  place_order client ~symbol ~price ~quantity ~side:Sell ()
+let is_connected (client : client) : bool =
+  client.connected
 
-(** Set user ID (for TCP mode where server assigns ID) *)
-let set_user_id client user_id =
+let set_user_id (client : client) (user_id : int32) : unit =
   client.user_id <- user_id
 
-(** Get current user ID *)
-let get_user_id client = client.user_id
+let get_user_id (client : client) : int32 =
+  client.user_id
 
-(** Get connection info string *)
-let info client =
-  match client.connection with
-  | Some conn -> Transport.connection_info conn
-  | None -> "Not connected"
+let get_connection (client : client) : Transport.connection option =
+  client.connection
 
 (** ============================================================================
     Response Filtering Helpers
     ============================================================================ *)
 
-(** Filter for acks only *)
-let filter_acks msgs =
-  List.filter_map (function Ack a -> Some a | _ -> None) msgs
+let filter_acks (msgs : Message_types.output_msg list) : Message_types.ack list =
+  List.filter_map (function Message_types.Ack a -> Some a | _ -> None) msgs
 
-(** Filter for trades only *)
-let filter_trades msgs =
-  List.filter_map (function Trade t -> Some t | _ -> None) msgs
+let filter_trades (msgs : Message_types.output_msg list) : Message_types.trade list =
+  List.filter_map (function Message_types.Trade t -> Some t | _ -> None) msgs
 
-(** Filter for TOB updates only *)
-let filter_tob msgs =
-  List.filter_map (function TopOfBook t -> Some t | _ -> None) msgs
+let filter_tob (msgs : Message_types.output_msg list) : Message_types.top_of_book list =
+  List.filter_map (function Message_types.TopOfBook t -> Some t | _ -> None) msgs
 
-(** Filter for cancel acks only *)
-let filter_cancel_acks msgs =
-  List.filter_map (function CancelAck c -> Some c | _ -> None) msgs
+let filter_cancel_acks (msgs : Message_types.output_msg list) : Message_types.cancel_ack list =
+  List.filter_map (function Message_types.CancelAck c -> Some c | _ -> None) msgs
 
-(** Check if any message is an error *)
-let has_error msgs =
-  List.exists (function Error _ -> true | _ -> false) msgs
+let has_error (msgs : Message_types.output_msg list) : bool =
+  List.exists (function Message_types.Error _ -> true | _ -> false) msgs
 
-(** Get first error message if any *)
-let get_error msgs =
-  List.find_map (function Error e -> Some e.error_text | _ -> None) msgs
-
+let get_error (msgs : Message_types.output_msg list) : string option =
+  List.find_map (function Message_types.Error e -> Some e.error_text | _ -> None) msgs

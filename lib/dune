@@ -3,5 +3,5 @@
 (library
  (name matching_engine_client)
  (public_name matching_engine_client)
- (libraries Unix)
+ (libraries unix)
  (flags (:standard -w +a-4-40-42-44-48-70 -warn-error -a)))
