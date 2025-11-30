@@ -16,8 +16,8 @@
 type client_config = {
   host: string;
   port: int;
-  transport: Message_types.transport option;  (* None = auto-discover *)
-  protocol: Message_types.protocol option;    (* None = auto-discover *)
+  transport: Message_types.transport option;
+  protocol: Message_types.protocol option;
   timeout: float;
   verbose: bool;
 }
@@ -75,31 +75,10 @@ let create (config : client_config) : client = {
 let connect (client : client) : (unit, client_error) result =
   let cfg = client.config in
   
-  (* Determine transport and protocol *)
-  let get_transport_protocol () =
-    match cfg.transport, cfg.protocol with
-    | Some t, Some p -> Ok (t, p)
-    | _ ->
-      (* Need to discover *)
-      match Discovery.discover ~host:cfg.host ~port:cfg.port ~timeout:cfg.timeout () with
-      | Result.Error e -> Result.Error (Discovery_failed (Discovery.discovery_error_to_string e))
-      | Ok result ->
-        let transport = match cfg.transport with
-          | Some t -> t
-          | None -> result.Discovery.transport
-        in
-        let protocol = match cfg.protocol with
-          | Some p -> p
-          | None -> result.Discovery.protocol
-        in
-        Ok (transport, protocol)
-  in
-  
-  match get_transport_protocol () with
-  | Result.Error e -> Result.Error e
-  | Ok (transport, protocol) ->
-    (* Create socket and connect *)
-    try
+  match cfg.transport, cfg.protocol with
+  | Some transport, Some protocol ->
+    (* No discovery needed, connect directly *)
+    begin try
       let sock_type = match transport with
         | Message_types.TCP -> Unix.SOCK_STREAM
         | Message_types.UDP -> Unix.SOCK_DGRAM
@@ -118,7 +97,6 @@ let connect (client : client) : (unit, client_error) result =
         in
         client.connection <- Some conn
       | Message_types.UDP ->
-        (* UDP doesn't need connect, but we store the remote address *)
         let conn = Transport.create_connection
           ~socket:sock ~transport ~protocol
           ~host:cfg.host ~port:cfg.port ~remote_addr:addr ()
@@ -129,7 +107,7 @@ let connect (client : client) : (unit, client_error) result =
       client.connected <- true;
       
       if cfg.verbose then
-        Printf.printf "Connected: %s\n%!" (info client);
+        Printf.printf "Connected to %s:%d\n%!" cfg.host cfg.port;
       
       Ok ()
     with
@@ -139,6 +117,47 @@ let connect (client : client) : (unit, client_error) result =
       Result.Error (Connection_failed (Printf.sprintf "Unknown host: %s" cfg.host))
     | e ->
       Result.Error (Connection_failed (Printexc.to_string e))
+    end
+    
+  | _ ->
+    (* Need to discover transport and/or protocol *)
+    let timeout_int = int_of_float cfg.timeout in
+    match Discovery.discover ~host:cfg.host ~port:cfg.port 
+        ~tcp_timeout:timeout_int ~udp_timeout:timeout_int () with
+    | Result.Error e -> 
+      Result.Error (Discovery_failed (Discovery.discovery_error_to_string e))
+    | Ok (result, sock) ->
+      let transport = match cfg.transport with
+        | Some t -> t
+        | None -> result.Discovery.transport
+      in
+      let protocol = match cfg.protocol with
+        | Some p -> p
+        | None -> result.Discovery.protocol
+      in
+      
+      (* Use the socket from discovery *)
+      let host_entry = Unix.gethostbyname cfg.host in
+      let addr = Unix.ADDR_INET (host_entry.Unix.h_addr_list.(0), cfg.port) in
+      
+      let conn = match transport with
+        | Message_types.TCP ->
+          Transport.create_connection
+            ~socket:sock ~transport ~protocol
+            ~host:cfg.host ~port:cfg.port ()
+        | Message_types.UDP ->
+          Transport.create_connection
+            ~socket:sock ~transport ~protocol
+            ~host:cfg.host ~port:cfg.port ~remote_addr:addr ()
+      in
+      
+      client.connection <- Some conn;
+      client.connected <- true;
+      
+      if cfg.verbose then
+        Printf.printf "Connected to %s:%d\n%!" cfg.host cfg.port;
+      
+      Ok ()
 
 (** Disconnect from server *)
 let disconnect (client : client) : unit =
@@ -153,13 +172,11 @@ let disconnect (client : client) : unit =
     Sending Messages
     ============================================================================ *)
 
-(** Get next order ID and increment counter *)
 let next_order_id (client : client) : int32 =
   let id = client.next_order_id in
   client.next_order_id <- Int32.add client.next_order_id 1l;
   id
 
-(** Send a new order *)
 let send_order (client : client) 
     ~symbol ~price ~quantity ~side ?order_id () 
     : (int32, client_error) result =
@@ -182,7 +199,6 @@ let send_order (client : client)
     | Result.Error e -> Result.Error (Send_error e)
     | Ok _ -> Ok oid
 
-(** Send cancel order *)
 let send_cancel (client : client) ~order_id () : (unit, client_error) result =
   match client.connection with
   | None -> Result.Error Not_connected
@@ -190,13 +206,12 @@ let send_cancel (client : client) ~order_id () : (unit, client_error) result =
     let cancel : Message_types.cancel_order = {
       cancel_user_id = client.user_id;
       cancel_user_order_id = order_id;
-      cancel_symbol = Message_types.Symbol.of_string_exn "?";  (* Not used in wire format *)
+      cancel_symbol = Message_types.Symbol.of_string_exn "?";
     } in
     match Transport.send conn (Message_types.CancelOrder cancel) with
     | Result.Error e -> Result.Error (Send_error e)
     | Ok _ -> Ok ()
 
-(** Send flush command *)
 let send_flush (client : client) : (unit, client_error) result =
   match client.connection with
   | None -> Result.Error Not_connected
@@ -205,7 +220,6 @@ let send_flush (client : client) : (unit, client_error) result =
     | Result.Error e -> Result.Error (Send_error e)
     | Ok _ -> Ok ()
 
-(** Send raw input message *)
 let send_raw (client : client) (msg : Message_types.input_msg) 
     : (unit, client_error) result =
   match client.connection with
@@ -219,7 +233,6 @@ let send_raw (client : client) (msg : Message_types.input_msg)
     Receiving Messages
     ============================================================================ *)
 
-(** Receive one message *)
 let recv ?(timeout = 5.0) (client : client) 
     : (Message_types.output_msg, client_error) result =
   match client.connection with
@@ -229,7 +242,6 @@ let recv ?(timeout = 5.0) (client : client)
     | Result.Error e -> Result.Error (Recv_error e)
     | Ok msg -> Ok msg
 
-(** Try to receive (non-blocking) *)
 let try_recv (client : client) 
     : (Message_types.output_msg option, client_error) result =
   match client.connection with
@@ -239,7 +251,6 @@ let try_recv (client : client)
     | Result.Error e -> Result.Error (Recv_error e)
     | Ok msg_opt -> Ok msg_opt
 
-(** Receive all available messages within timeout *)
 let recv_all ?(timeout = 1.0) (client : client) 
     : (Message_types.output_msg list, client_error) result =
   match client.connection with
@@ -254,7 +265,6 @@ let recv_all ?(timeout = 1.0) (client : client)
     High-Level Operations
     ============================================================================ *)
 
-(** Place order and wait for response *)
 let place_order (client : client)
     ~symbol ~price ~quantity ~side ?order_id ()
     : (int32 * Message_types.output_msg list, client_error) result =
@@ -265,26 +275,22 @@ let place_order (client : client)
     | Result.Error e -> Result.Error e
     | Ok msgs -> Ok (oid, msgs)
 
-(** Cancel order and wait for response *)
 let cancel_order (client : client) ~order_id ()
     : (Message_types.output_msg list, client_error) result =
   match send_cancel client ~order_id () with
   | Result.Error e -> Result.Error e
   | Ok () -> recv_all ~timeout:1.0 client
 
-(** Flush all orders and wait for response *)
 let flush_orders (client : client)
     : (Message_types.output_msg list, client_error) result =
   match send_flush client with
   | Result.Error e -> Result.Error e
   | Ok () -> recv_all ~timeout:2.0 client
 
-(** Convenience: place buy order *)
 let buy (client : client) ~symbol ~price ~quantity ?order_id ()
     : (int32 * Message_types.output_msg list, client_error) result =
   place_order client ~symbol ~price ~quantity ~side:Message_types.Buy ?order_id ()
 
-(** Convenience: place sell order *)
 let sell (client : client) ~symbol ~price ~quantity ?order_id ()
     : (int32 * Message_types.output_msg list, client_error) result =
   place_order client ~symbol ~price ~quantity ~side:Message_types.Sell ?order_id ()

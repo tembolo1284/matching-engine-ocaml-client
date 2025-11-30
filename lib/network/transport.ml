@@ -148,7 +148,7 @@ let recv_tcp_framed (conn : connection) ~timeout
       | Ok payload ->
         match conn.protocol with
         | Message_types.Binary ->
-          Binary_codec.decode_output_msg payload 0 len
+          Binary_codec.decode_output_msg payload
           |> Result.map_error (fun e -> 
                Decode_error (Binary_codec.decode_error_to_string e))
         | Message_types.CSV ->
@@ -192,7 +192,7 @@ let recv_udp (conn : connection) ~timeout
       else
         match conn.protocol with
         | Message_types.Binary ->
-          Binary_codec.decode_output_msg buf 0 len
+          Binary_codec.decode_output_msg (Bytes.sub buf 0 len)
           |> Result.map_error (fun e -> 
                Decode_error (Binary_codec.decode_error_to_string e))
         | Message_types.CSV ->
