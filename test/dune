@@ -1,0 +1,6 @@
+; test/dune
+
+(test
+ (name test_protocol)
+ (libraries matching_engine_client unix)
+ (modules test_protocol))
