@@ -1,6 +1,4 @@
-; dune-project
-
-(lang dune 3.0)
+(lang dune 2.9)
 (name matching_engine_client)
 (version 0.1.0)
 

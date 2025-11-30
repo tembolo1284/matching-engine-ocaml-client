@@ -1,22 +1,7 @@
-; lib/dune (UPDATE THIS)
+(include_subdirs unqualified)
 
 (library
  (name matching_engine_client)
  (public_name matching_engine_client)
- (libraries unix)
- (modules
-   ; Protocol modules
-   message_types
-   binary_codec
-   csv_codec
-   ; Network modules
-   discovery
-   transport
-   multicast
-   ; Client modules
-   engine_client
-   interactive
-   batch)
- ; Include subdirectories
- (include_subdirs unqualified)
+ (libraries Unix)
  (flags (:standard -w +a-4-40-42-44-48-70 -warn-error -a)))

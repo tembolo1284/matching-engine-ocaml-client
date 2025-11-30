@@ -1,8 +1,6 @@
-; bin/dune
-
 (executable
  (name main)
  (public_name me_client)
  (package matching_engine_client)
- (libraries matching_engine_client unix)
+ (libraries matching_engine_client Unix)
  (flags (:standard -w +a-4-40-42-44-48-70 -warn-error -a)))

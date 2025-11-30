@@ -440,10 +440,11 @@ let run (client : Engine_client.client) : unit =
 
 (** Connect and run REPL in one call *)
 let start ~host ~port ?transport ?protocol () : unit =
+  let base_config = Engine_client.default_config ~host ~port () in
   let config = {
-    Engine_client.default_config ~host ~port () with
-    transport;
-    protocol;
+    base_config with
+    Engine_client.transport = transport;
+    protocol = protocol;
     verbose = false;
   } in
   let client = Engine_client.create config in

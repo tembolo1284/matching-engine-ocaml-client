@@ -314,5 +314,4 @@ let list_scenarios () : unit =
     let (name, _) = scenarios.(i - 1) (Obj.magic ()) in  (* Dummy client just to get name *)
     Printf.printf "  %d. %s\n" i name
   done
-```
 
