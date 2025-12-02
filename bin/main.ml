@@ -67,7 +67,7 @@ OPTIONS:
     --csv                   Force CSV protocol
     --binary                Force binary protocol
 
-    -s, --scenario N        Run scenario N (1-6)
+    -s, --scenario N        Run scenario N
     -f, --file PATH         Execute commands from file
     -l, --load-test N       Fire-and-forget N orders
     --symbol SYM            Symbol for load test (default: IBM)
@@ -233,6 +233,26 @@ let parse_args () : cli_args =
   !args
 
 (** ============================================================================
+    Helper: Get connection info string
+    ============================================================================ *)
+
+let get_connection_info (client : Engine_client.client) (args : cli_args) 
+    : string * string * bool * bool =
+  match Engine_client.get_connection client with
+  | None -> ("unknown", "unknown", false, false)
+  | Some conn -> 
+    let transport = if Transport.is_tcp conn then "TCP" else "UDP" in
+    let protocol = if Transport.is_binary conn then "Binary" else "CSV" in
+    let transport_auto = Option.is_none args.transport in
+    let protocol_auto = Option.is_none args.protocol in
+    (transport, protocol, transport_auto, protocol_auto)
+
+let print_banner () =
+  Printf.printf "===========================================\n";
+  Printf.printf "  Matching Engine OCaml Client v1.0.0\n";
+  Printf.printf "===========================================\n"
+
+(** ============================================================================
     Mode Implementations
     ============================================================================ *)
 
@@ -262,7 +282,6 @@ let run_discover_only (args : cli_args) : unit =
 let run_multicast (group_str : string) (port : int) (verbose : bool) : unit =
   Printf.printf "Subscribing to multicast %s:%d...\n%!" group_str port;
 
-  (* Parse the group address *)
   let group_addr = 
     try Unix.inet_addr_of_string group_str
     with _ ->
@@ -280,14 +299,12 @@ let run_multicast (group_str : string) (port : int) (verbose : bool) : unit =
   | Ok () ->
     Printf.printf "Subscribed! Waiting for market data (Ctrl+C to stop)...\n\n%!";
 
-    (* Set up signal handler for clean exit *)
     let running = ref true in
     Sys.set_signal Sys.sigint (Sys.Signal_handle (fun _ ->
       running := false;
       print_newline ()
     ));
 
-    (* Receive loop *)
     while !running do
       match Multicast.try_recv sub with
       | Ok (Some msg) ->
@@ -296,13 +313,11 @@ let run_multicast (group_str : string) (port : int) (verbose : bool) : unit =
         else
           Printf.printf "%s\n%!" (Message_types.output_msg_to_csv msg)
       | Ok None ->
-        (* No data, sleep briefly *)
         Unix.sleepf 0.01
       | Result.Error e ->
         Printf.printf "Error: %s\n%!" (Multicast.recv_error_to_string e)
     done;
 
-    (* Print stats and cleanup *)
     print_newline ();
     print_endline "--- Multicast Statistics ---";
     print_endline (Multicast.stats_to_string sub);
@@ -321,36 +336,48 @@ let create_client (args : cli_args) : Engine_client.client option =
 
   let client = Engine_client.create config in
 
-  (* Set user ID if specified *)
   begin match args.user_id with
   | Some id -> Engine_client.set_user_id client id
   | None -> ()
   end;
 
-  (* Connect *)
   match Engine_client.connect client with
   | Result.Error e ->
     Printf.printf "Connection failed: %s\n"
       (Engine_client.client_error_to_string e);
     None
   | Ok () ->
-    if args.verbose then
-      Printf.printf "Connected: %s\n%!" (Engine_client.info client);
     Some client
 
 (** Run scenario mode *)
 let run_scenario (args : cli_args) (n : int) : unit =
-  match create_client args with
-  | None -> exit 1
-  | Some client ->
-    begin match Batch.get_scenario n with
-    | None ->
-      Printf.printf "Unknown scenario: %d\n" n;
-      Batch.list_scenarios ();
-      Engine_client.disconnect client;
-      exit 1
-    | Some scenario ->
-      Printf.printf "Running scenario %d: %s\n%!" n scenario.Batch.name;
+  print_banner ();
+  Printf.printf "Target:     %s:%d\n" args.host args.port;
+  Printf.printf "Transport:  %s\n" 
+    (match args.transport with Some Message_types.TCP -> "TCP" 
+     | Some Message_types.UDP -> "UDP" | None -> "auto");
+  Printf.printf "Encoding:   %s\n"
+    (match args.protocol with Some Message_types.Binary -> "Binary" 
+     | Some Message_types.CSV -> "CSV" | None -> "auto");
+  Printf.printf "Mode:       scenario\n";
+  
+  match Batch.get_scenario n with
+  | None ->
+    Printf.printf "\nUnknown scenario: %d\n\n" n;
+    Batch.list_scenarios ();
+    exit 1
+  | Some scenario ->
+    Printf.printf "Scenario:   %d - %s\n" n scenario.Batch.name;
+    Printf.printf "\nConnecting to %s:%d...\n%!" args.host args.port;
+    
+    match create_client args with
+    | None -> exit 1
+    | Some client ->
+      (* Show what we connected with *)
+      let (transport, protocol, t_auto, p_auto) = get_connection_info client args in
+      Printf.printf "Connected via %s%s\n" transport (if t_auto then " (auto-detected)" else "");
+      Printf.printf "Server encoding: %s%s\n\n%!" protocol (if p_auto then " (auto-detected)" else "");
+      
       match Batch.run_scenario client scenario with
       | Result.Error e ->
         Printf.printf "Error: %s\n" (Batch.batch_error_to_string e);
@@ -360,13 +387,22 @@ let run_scenario (args : cli_args) (n : int) : unit =
         Batch.print_result result;
         Engine_client.disconnect client;
         if result.errors > 0 then exit 1
-    end
 
 (** Run file mode *)
 let run_file (args : cli_args) (path : string) : unit =
+  print_banner ();
+  Printf.printf "Target:     %s:%d\n" args.host args.port;
+  Printf.printf "Mode:       file\n";
+  Printf.printf "File:       %s\n" path;
+  Printf.printf "\nConnecting to %s:%d...\n%!" args.host args.port;
+  
   match create_client args with
   | None -> exit 1
   | Some client ->
+    let (transport, protocol, t_auto, p_auto) = get_connection_info client args in
+    Printf.printf "Connected via %s%s\n" transport (if t_auto then " (auto-detected)" else "");
+    Printf.printf "Server encoding: %s%s\n\n%!" protocol (if p_auto then " (auto-detected)" else "");
+    
     begin match Batch.run_file client path with
     | Result.Error e ->
       Printf.printf "Error: %s\n" (Batch.batch_error_to_string e);
@@ -380,18 +416,39 @@ let run_file (args : cli_args) (path : string) : unit =
 
 (** Run load test mode *)
 let run_load_test (args : cli_args) (count : int) (symbol : string) : unit =
+  print_banner ();
+  Printf.printf "Target:     %s:%d\n" args.host args.port;
+  Printf.printf "Mode:       load-test (fire-and-forget)\n";
+  Printf.printf "Orders:     %d\n" count;
+  Printf.printf "Symbol:     %s\n" symbol;
+  Printf.printf "\nConnecting to %s:%d...\n%!" args.host args.port;
+  
   match create_client args with
   | None -> exit 1
   | Some client ->
+    let (transport, protocol, t_auto, p_auto) = get_connection_info client args in
+    Printf.printf "Connected via %s%s\n" transport (if t_auto then " (auto-detected)" else "");
+    Printf.printf "Server encoding: %s%s\n\n%!" protocol (if p_auto then " (auto-detected)" else "");
+    
+    Printf.printf "Sending %d orders (fire-and-forget)...\n%!" count;
     let stats = Batch.run_load_test client ~symbol ~count () in
     Batch.print_fire_forget_stats stats;
     Engine_client.disconnect client
 
 (** Run interactive mode *)
 let run_interactive (args : cli_args) : unit =
+  print_banner ();
+  Printf.printf "Target:     %s:%d\n" args.host args.port;
+  Printf.printf "Mode:       interactive\n";
+  Printf.printf "\nConnecting to %s:%d...\n%!" args.host args.port;
+  
   match create_client args with
   | None -> exit 1
   | Some client ->
+    let (transport, protocol, t_auto, p_auto) = get_connection_info client args in
+    Printf.printf "Connected via %s%s\n" transport (if t_auto then " (auto-detected)" else "");
+    Printf.printf "Server encoding: %s%s\n\n%!" protocol (if p_auto then " (auto-detected)" else "");
+    
     Interactive.run client
 
 (** ============================================================================
